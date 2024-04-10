@@ -27,6 +27,7 @@ require (
 	github.com/quic-go/quic-go v0.42.0
 	go.etcd.io/etcd/api/v3 v3.5.12
 	go.etcd.io/etcd/client/v3 v3.5.12
+	go.nanomsg.org/mangos/v3 v3.4.2
 	golang.org/x/crypto v0.21.0
 	golang.org/x/sys v0.19.0
 	google.golang.org/api v0.172.0

@@ -69,4 +69,5 @@ var Directives = []string{
 	"sign",
 	"view",
 	"nomad",
+	"zenet",
 }

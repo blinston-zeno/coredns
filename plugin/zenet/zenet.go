@@ -202,33 +202,31 @@ func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		return dns.RcodeNameError, nil
 	}
 
-	values := reply.Query
-	if len(values) == 0 {
-		nodataCount.WithLabelValues(server).Inc()
-		if z.Fall.Through(state.Name()) {
-			return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
-		}
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Authoritative = true
-		if err := w.WriteMsg(m); err != nil {
-			return dns.RcodeServerFailure, err
-		}
-		return dns.RcodeSuccess, nil
-	}
-
 	m := new(dns.Msg)
 	m.SetReply(r)
 	m.Authoritative = true
 
 	switch state.QType() {
 	case dns.TypeA, dns.TypeAAAA:
-		if err := appendIPAnswers(m, values, state.QName(), state.QType(), z.ttl); err != nil {
+		if err := appendIPAnswers(m, reply.Query, state.QName(), state.QType(), z.ttl); err != nil {
 			errorsCount.WithLabelValues(server, "bad_ip").Inc()
 			return dns.RcodeServerFailure, err
 		}
 	case dns.TypeTXT:
-		appendTXTAnswers(m, values, state.QName(), z.ttl)
+		appendTXTAnswers(m, reply.Query, state.QName(), z.ttl)
+	}
+
+	if len(m.Answer) == 0 {
+		// No-data: the backend returned an empty result, or only addresses
+		// of the other family (e.g. an A query answered with IPv6 only).
+		nodataCount.WithLabelValues(server).Inc()
+		if z.Fall.Through(state.Name()) {
+			return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
+		}
+		if err := w.WriteMsg(m); err != nil {
+			return dns.RcodeServerFailure, err
+		}
+		return dns.RcodeSuccess, nil
 	}
 
 	requestsCount.WithLabelValues(server, qtype).Inc()
@@ -264,11 +262,10 @@ func (z *Zenet) serveFromStore(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	// The record TTL never outlives the smallest remaining lease, capped by
 	// the configured ttl: a downstream cache must not hand out a replica
-	// past its lease.
+	// past its lease. Truncate, never round up — a sub-second remaining
+	// lease yields TTL 0 (do not cache). A configured `ttl 0` therefore
+	// serves every answer uncached.
 	ttl := uint32(minRemaining / time.Second)
-	if ttl < 1 {
-		ttl = 1
-	}
 	if ttl > z.ttl {
 		ttl = z.ttl
 	}

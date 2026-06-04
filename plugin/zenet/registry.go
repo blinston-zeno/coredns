@@ -43,16 +43,24 @@ const (
 	defaultSweepInterval  = 1 * time.Second
 )
 
+// Worker pool bounds. The default is NumCPU clamped to [minDefaultWorkers,
+// maxWorkers]; an explicit registry_workers value is validated against
+// [1, maxWorkers] at parse time.
+const (
+	minDefaultWorkers = 4
+	maxWorkers        = 64
+)
+
 // defaultWorkers sizes the REP handler pool: registration handling is a
 // short in-memory map operation, so a small pool bounded by core count is
 // plenty even at high heartbeat rates.
 func defaultWorkers() int {
 	n := runtime.NumCPU()
-	if n < 4 {
-		return 4
+	if n < minDefaultWorkers {
+		return minDefaultWorkers
 	}
-	if n > 64 {
-		return 64
+	if n > maxWorkers {
+		return maxWorkers
 	}
 	return n
 }
@@ -159,13 +167,28 @@ func (s *RegistryStore) Register(name string, urls []string, ttl time.Duration, 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.now()
 
 	entry, ok := s.names[cname]
 	if !ok {
 		if len(s.names) >= s.maxNames {
-			return errCapacity
+			// Expired-but-unswept entries may be holding name capacity;
+			// reclaim before rejecting (rare: only at the capacity edge).
+			s.sweepLocked(now)
+			if len(s.names) >= s.maxNames {
+				return errCapacity
+			}
 		}
 		entry = &serviceEntry{eps: make(map[string]*endpoint)}
+	} else {
+		// Expired endpoints must not count against maxEndpoints: a dead
+		// replica's slot is free as soon as its lease lapses, not only
+		// after the next sweep.
+		for url, ep := range entry.eps {
+			if !ep.expires.After(now) {
+				delete(entry.eps, url)
+			}
+		}
 	}
 
 	added := 0
@@ -178,7 +201,7 @@ func (s *RegistryStore) Register(name string, urls []string, ttl time.Duration, 
 		return fmt.Errorf("%w: %d existing + %d new > %d", errTooManyEndpoints, len(entry.eps), added, s.maxEndpoints)
 	}
 
-	expires := s.now().Add(ttl)
+	expires := now.Add(ttl)
 	for _, p := range eps {
 		entry.eps[p.url] = &endpoint{
 			url:     p.url,
@@ -261,14 +284,23 @@ func (s *RegistryStore) Discover(name string) (eps []endpoint, minRemaining time
 	return eps, minRemaining, true
 }
 
-// Sweep removes all expired endpoints and empty names, returning the number
-// of endpoints reclaimed.
-func (s *RegistryStore) Sweep() int {
+// Sweep removes all expired endpoints and empty names. It returns the number
+// of endpoints reclaimed plus the surviving name and endpoint counts, so the
+// sweeper can refresh its gauges without a second full scan.
+func (s *RegistryStore) Sweep() (reclaimed, names, endpoints int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := s.now()
-	reclaimed := 0
+	reclaimed = s.sweepLocked(s.now())
+	for _, entry := range s.names {
+		endpoints += len(entry.eps)
+	}
+	return reclaimed, len(s.names), endpoints
+}
+
+// sweepLocked removes expired endpoints and empty names. Callers hold the
+// write lock.
+func (s *RegistryStore) sweepLocked(now time.Time) (reclaimed int) {
 	for name, entry := range s.names {
 		for url, ep := range entry.eps {
 			if !ep.expires.After(now) {
@@ -281,6 +313,28 @@ func (s *RegistryStore) Sweep() int {
 		}
 	}
 	return reclaimed
+}
+
+// adoptFrom copies every registration from old into s (deep copy; the donor
+// is left untouched). Used when a reload moves the registry listen address:
+// the new runner's store inherits the live registrations so DNS answers
+// survive the move. Returns the number of names copied.
+func (s *RegistryStore) adoptFrom(old *RegistryStore) int {
+	old.mu.RLock()
+	defer old.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for name, entry := range old.names {
+		ne := &serviceEntry{eps: make(map[string]*endpoint, len(entry.eps))}
+		for url, ep := range entry.eps {
+			cp := *ep
+			cp.meta = copyMeta(ep.meta)
+			ne.eps[url] = &cp
+		}
+		s.names[name] = ne
+	}
+	return len(old.names)
 }
 
 // Stats returns the number of stored names and endpoints (including any

@@ -86,6 +86,36 @@ func TestStoreServeTTLTracksLease(t *testing.T) {
 	}
 }
 
+// TestStoreServeTTLSubSecondLease is a regression test: a lease in its final
+// sub-second must serve TTL 0 (do not cache), never be rounded up to 1 — a
+// downstream cache must not outlive the lease.
+func TestStoreServeTTLSubSecondLease(t *testing.T) {
+	z, s, clk := newTestRegistryZenet(t)
+	mustRegister(t, s, "svc.cloud.zeno.", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil)
+
+	clk.Advance(29*time.Second + 600*time.Millisecond) // 400ms of lease left
+	code, err, msg := doQuery(t, z, "svc.cloud.zeno.", dns.TypeA)
+	if err != nil || code != dns.RcodeSuccess {
+		t.Fatalf("expected success, got code=%d err=%v", code, err)
+	}
+	if len(msg.Answer) != 1 || msg.Answer[0].Header().Ttl != 0 {
+		t.Fatalf("expected TTL 0 for a sub-second lease, got %+v", msg.Answer)
+	}
+}
+
+// TestStoreServeTTLZeroConfig: a configured `ttl 0` serves every answer
+// uncached (TTL 0) — the documented no-cache mode.
+func TestStoreServeTTLZeroConfig(t *testing.T) {
+	z, s, _ := newTestRegistryZenet(t)
+	z.ttl = 0
+	mustRegister(t, s, "svc.cloud.zeno.", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil)
+
+	_, _, msg := doQuery(t, z, "svc.cloud.zeno.", dns.TypeA)
+	if len(msg.Answer) != 1 || msg.Answer[0].Header().Ttl != 0 {
+		t.Fatalf("expected TTL 0 with ttl 0 configured, got %+v", msg.Answer)
+	}
+}
+
 func TestStoreServeAAAA(t *testing.T) {
 	z, s, _ := newTestRegistryZenet(t)
 	mustRegister(t, s, "svc.cloud.zeno.", []string{"tcp://[fd00::1]:40901", "tcp://10.0.0.1:40901"}, 30*time.Second, nil)

@@ -30,9 +30,13 @@ within its TTL. Multiple endpoints (replicas) per name are first-class; each end
 independently.
 
 The registry survives Corefile reloads: the new plugin instance adopts the existing listener and
-its registrations. Changing the registry listen address (or `registry_workers` /
-`registry_sweep_interval`) requires a full process restart; the numeric bounds
-(`registry_max_*`, `registry_min_ttl`, `registry_max_ttl`) are re-applied on reload.
+its registrations, and the numeric bounds (`registry_max_*`, `registry_min_ttl`,
+`registry_max_ttl`) are re-applied when the reload commits — a reload that fails validation leaves
+the running configuration untouched. Changing the registry listen address on reload migrates the
+registrations to a new listener on the new address and stops the old one; services must heartbeat
+the new address from then on (a warning is logged). Removing the registry block from the config
+stops its listener and drops its registrations. `registry_workers` and `registry_sweep_interval`
+are structural and keep their running values until a process restart.
 
 ## Syntax
 
@@ -82,12 +86,14 @@ zenet [ZONES...] {
 * `registry_max_names` maximum number of registered service names. Default: `10000`.
 * `registry_max_endpoints` maximum endpoints (replicas) per name. Default: `64`.
 * `registry_max_payload` maximum registry message size in bytes. Default: `16384`.
-* `registry_workers` REP handler contexts serving registry messages. Default: number of CPUs,
-  clamped to [4, 64].
+* `registry_workers` REP handler contexts serving registry messages, in the range [1, 64].
+  Default: number of CPUs, clamped to [4, 64].
 * `registry_sweep_interval` how often expired endpoints are reclaimed. Default: `1s`. (Expiry is
   also enforced lazily on every read, so this only affects memory reclamation.)
 * `ttl` in registry mode is the *ceiling* for record TTLs: the actual TTL is the smaller of the
-  remaining lease and this value, so downstream caches never outlive a lease.
+  remaining lease (truncated to whole seconds — a lease in its final sub-second serves TTL 0) and
+  this value, so downstream caches never outlive a lease. `ttl 0` serves every answer with TTL 0
+  (no caching).
 * `fallthrough` as in resolver mode, for NXDOMAIN and no-data answers.
 
 ## Wire protocol (resolver mode)
@@ -118,7 +124,8 @@ JSON messages over a mangos REQ/REP socket, one operation per message. Exactly o
 `unregister` or `discover` must be present. `version` is optional and defaults to `1`. `token` is
 parsed but ignored in v1 (reserved for shared-secret authentication). Names are canonicalized
 server-side (lowercase, trailing dot). Endpoint URLs must be `tcp://` with an IP-literal host and a
-non-zero port.
+numeric port in [1, 65535] (service names like `:http` are rejected — the port string surfaces
+verbatim in TXT answers).
 
 Register (also the heartbeat — an idempotent upsert that refreshes the lease of every listed
 endpoint):
@@ -145,7 +152,8 @@ Discover:
 {"discover": {"name": "svc.cloud.zeno"}}
 ~~~
 
-Reply when found (`ttl` is the smallest remaining lease in seconds; `endpoints` are sorted by URL):
+Reply when found (`ttl` is the smallest remaining lease in seconds, truncated — `0` means less
+than one second remains; `endpoints` are sorted by URL):
 
 ~~~ json
 {"ok": true, "found": true, "endpoints": ["tcp://10.0.0.12:40901", "tcp://10.0.0.13:40901"], "meta": {"proto": "rep0"}, "ttl": 27}
@@ -266,5 +274,6 @@ Negative answers (NXDOMAIN and no-data) carry no SOA record in the authority sec
 backend has no zone/SOA concept; downstream resolvers therefore cannot negatively cache them
 (RFC 2308).
 
-In registry mode, changing the `registry` listen address via Corefile reload does not move the
-listener; the old address stays bound until the process is restarted.
+If a single reload both adds and removes more than one registry listen address, registrations are
+not migrated between them (the mapping would be ambiguous); the removed listeners are stopped and
+their registrations dropped, with a warning logged.

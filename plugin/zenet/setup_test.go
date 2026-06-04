@@ -178,6 +178,19 @@ func TestParseRegistry(t *testing.T) {
 			registry
 			registry_workers -1
 		}`, true},
+		// registry_workers is bounded by [1, 64].
+		{`zenet {
+			registry
+			registry_workers 65
+		}`, true},
+		{`zenet {
+			registry
+			registry_workers 64
+		}`, false},
+		{`zenet {
+			registry
+			registry_workers 1
+		}`, false},
 		{`zenet {
 			registry
 			registry_sweep_interval 0s

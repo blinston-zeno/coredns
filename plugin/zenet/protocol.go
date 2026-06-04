@@ -3,6 +3,7 @@ package zenet
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -72,7 +73,9 @@ type discoverBody struct {
 
 // registryReply is the response to any registryRequest. OK reports protocol
 // success; "name not found" on discover is OK with Found=false, not an error.
-// TTL is the smallest remaining lease in seconds across returned endpoints.
+// TTL is the smallest remaining lease in seconds across returned endpoints,
+// truncated — 0 means less than one second remains. It is always present so
+// a truthful 0 cannot be confused with an absent field.
 type registryReply struct {
 	OK        bool              `json:"ok"`
 	Error     string            `json:"error,omitempty"`
@@ -80,7 +83,7 @@ type registryReply struct {
 	Found     *bool             `json:"found,omitempty"`
 	Endpoints []string          `json:"endpoints,omitempty"`
 	Meta      map[string]string `json:"meta,omitempty"`
-	TTL       uint32            `json:"ttl,omitempty"`
+	TTL       uint32            `json:"ttl"`
 }
 
 // canonicalizeName validates a service name and returns its canonical DNS
@@ -100,9 +103,11 @@ func canonicalizeName(name string) (string, error) {
 
 // parseEndpointURL validates a registered endpoint URL and returns its host
 // and port. v1 deliberately accepts only tcp:// with an IP-literal host and a
-// non-zero port: A/AAAA synthesis needs IP literals, and rejecting hostnames
-// loudly here beats silently serving no-data later. Other nng transports
-// (ipc, inproc, tls+tcp, ws) are future work.
+// numeric, non-zero port: A/AAAA synthesis needs IP literals, the port string
+// surfaces verbatim in TXT answers (so service names like "http" must be
+// rejected, not resolved), and rejecting loudly here beats silently serving
+// no-data later. Other nng transports (ipc, inproc, tls+tcp, ws) are future
+// work.
 func parseEndpointURL(raw string) (host, port string, err error) {
 	rest, ok := strings.CutPrefix(raw, "tcp://")
 	if !ok {
@@ -115,9 +120,9 @@ func parseEndpointURL(raw string) (host, port string, err error) {
 	if net.ParseIP(host) == nil {
 		return "", "", fmt.Errorf("endpoint %q: host must be an IP literal", raw)
 	}
-	p, err := net.LookupPort("tcp", port)
+	p, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || p == 0 {
-		return "", "", fmt.Errorf("endpoint %q: invalid port %q", raw, port)
+		return "", "", fmt.Errorf("endpoint %q: port must be numeric in [1, 65535]: %q", raw, port)
 	}
 	return host, port, nil
 }

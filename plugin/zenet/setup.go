@@ -29,21 +29,34 @@ func setup(c *caddy.Controller) error {
 
 	if z.mode == modeRegistry {
 		addr := z.regCfg.listen
-		r := runners.getOrSet(addr, func() *runner { return newRunner(z.regCfg) })
-		// Adoption path (Corefile reload): refresh the numeric bounds from
-		// the re-parsed config. listen, workers and sweep_interval are
-		// structural and keep their original values until process restart.
-		r.store.SetBounds(z.regCfg)
+		r := runners.claim(addr, func() *runner { return newRunner(z.regCfg) })
 		z.store = r.store
 		z.runner = r
 
-		c.OnStartup(func() error { regUniq.Set(addr, r.start); return regUniq.ForEach() })
-		c.OnRestartFailed(func() error { regUniq.Set(addr, r.start); return regUniq.ForEach() })
-		// On reload only the once-latch is reset; the listener and the
-		// registration state deliberately survive (see shared.go). Real
-		// teardown happens at final process shutdown only.
-		c.OnRestart(func() error { regUniq.Unset(addr); return nil })
-		c.OnFinalShutdown(r.stop)
+		// Everything that mutates shared state runs in OnStartup, i.e. only
+		// when this config generation actually commits: a reload that fails
+		// validation must leave neither its bounds nor its listener changes
+		// behind. reconcile stops listeners the new config no longer
+		// references (migrating their registrations on an address change,
+		// see shared.go); start is idempotent and reports bind errors, so a
+		// dead listener fails startup loudly instead of silently.
+		c.OnStartup(func() error {
+			runners.reconcile()
+			z.store.SetBounds(z.regCfg)
+			return z.runner.start()
+		})
+		// OnRestart runs on the old instance before the new config is even
+		// parsed: it marks the generation boundary for claim tracking.
+		c.OnRestart(func() error { runners.beginGeneration(); return nil })
+		// A failed reload rolls back to this instance; its OnStartup may
+		// already have applied the discarded config's bounds or stopped this
+		// runner as the stale side of an address change. Restore both.
+		c.OnRestartFailed(func() error {
+			z.runner = runners.revive(addr, z.regCfg, z.store)
+			z.store.SetBounds(z.regCfg)
+			return z.runner.start()
+		})
+		c.OnFinalShutdown(func() error { return z.runner.stop() })
 	} else {
 		c.OnStartup(z.OnStartup)
 		c.OnShutdown(z.OnShutdown)
@@ -188,6 +201,9 @@ func parse(c *caddy.Controller) (*Zenet, error) {
 			case "registry_max_payload":
 				z.regCfg.maxPayload = n
 			case "registry_workers":
+				if n > maxWorkers {
+					return nil, c.Errf("registry_workers must be in [1, %d]: %d", maxWorkers, n)
+				}
 				z.regCfg.workers = n
 			}
 			if c.NextArg() {

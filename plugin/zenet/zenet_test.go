@@ -272,6 +272,42 @@ func TestServeDNSExplicitNoError(t *testing.T) {
 	}
 }
 
+// TestServeDNSCrossFamilyNoData is a regression test: a non-empty backend
+// reply holding only addresses of the other family must be answered as
+// no-data (and counted as such), not as a bare empty NOERROR.
+func TestServeDNSCrossFamilyNoData(t *testing.T) {
+	addr := "inproc://zenet-test-crossfam"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		return jsonReply("fd00::1") // AAAA-only reply to an A query
+	})
+	z := newTestZenet(t, addr)
+
+	code, err, msg := doQuery(t, z, "host.example.org.", dns.TypeA)
+	if err != nil || code != dns.RcodeSuccess {
+		t.Fatalf("expected NOERROR no-data, got code=%d err=%v", code, err)
+	}
+	if len(msg.Answer) != 0 {
+		t.Errorf("expected empty answer, got %v", msg.Answer)
+	}
+}
+
+// TestServeDNSCrossFamilyFallthrough: with fallthrough configured, a
+// cross-family (effectively empty) result must reach the next plugin.
+func TestServeDNSCrossFamilyFallthrough(t *testing.T) {
+	addr := "inproc://zenet-test-crossfam-fall"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		return jsonReply("fd00::1")
+	})
+	z := newTestZenet(t, addr)
+	z.Fall = fall.Root
+	z.Next = test.NextHandler(dns.RcodeRefused, nil)
+
+	code, err, _ := doQuery(t, z, "host.example.org.", dns.TypeA)
+	if err != nil || code != dns.RcodeRefused {
+		t.Fatalf("expected fallthrough to next plugin (REFUSED), got code=%d err=%v", code, err)
+	}
+}
+
 func TestServeDNSBadIP(t *testing.T) {
 	addr := "inproc://zenet-test-badip"
 	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {

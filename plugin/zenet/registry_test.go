@@ -127,11 +127,11 @@ func TestPerEndpointExpiry(t *testing.T) {
 		t.Fatalf("expected 15s remaining, got %s", remaining)
 	}
 
-	// The sweeper reclaims exactly the dead endpoint.
-	if got := s.Sweep(); got != 1 {
-		t.Fatalf("expected Sweep to reclaim 1 endpoint, got %d", got)
+	// The sweeper reclaims exactly the dead endpoint and reports survivors.
+	reclaimed, names, endpoints := s.Sweep()
+	if reclaimed != 1 {
+		t.Fatalf("expected Sweep to reclaim 1 endpoint, got %d", reclaimed)
 	}
-	names, endpoints := s.Stats()
 	if names != 1 || endpoints != 1 {
 		t.Fatalf("expected 1 name / 1 endpoint after sweep, got %d/%d", names, endpoints)
 	}
@@ -196,6 +196,8 @@ func TestRegisterValidation(t *testing.T) {
 		{"svc.cloud.zeno", []string{"tcp://10.0.0.1"}, errEndpointInvalid},         // missing port
 		{"svc.cloud.zeno", []string{"tcp://10.0.0.1:0"}, errEndpointInvalid},
 		{"svc.cloud.zeno", []string{"tcp://10.0.0.1:notaport"}, errEndpointInvalid},
+		{"svc.cloud.zeno", []string{"tcp://10.0.0.1:http"}, errEndpointInvalid},  // named ports are rejected, not resolved
+		{"svc.cloud.zeno", []string{"tcp://10.0.0.1:65536"}, errEndpointInvalid}, // out of port range
 		{"svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "bogus"}, errEndpointInvalid},
 	}
 	for _, c := range cases {
@@ -247,6 +249,73 @@ func TestTooManyEndpoints(t *testing.T) {
 	// Refreshing the existing endpoints never counts against the cap.
 	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil); err != nil {
 		t.Fatalf("refresh at endpoint cap: %v", err)
+	}
+}
+
+// TestExpiredEndpointsFreeTheirSlots is a regression test: endpoints whose
+// lease has lapsed must not count against maxEndpoints in the window before
+// the sweeper reclaims them.
+func TestExpiredEndpointsFreeTheirSlots(t *testing.T) {
+	s, clk := newTestStore(t, func(c *registryConfig) { c.maxEndpoints = 2 })
+
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 5*time.Second, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	clk.Advance(6 * time.Second) // both leases lapsed; no sweep has run
+
+	// A new replica must be accepted: the dead endpoints' slots are free.
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.3:3333"}, 5*time.Second, nil); err != nil {
+		t.Fatalf("register after expiry must succeed, got: %v", err)
+	}
+	eps, _, found := s.Discover("svc.cloud.zeno")
+	if !found || len(eps) != 1 || eps[0].url != "tcp://10.0.0.3:3333" {
+		t.Fatalf("expected only the fresh endpoint, got %v (found=%v)", eps, found)
+	}
+}
+
+// TestExpiredNamesFreeNameCapacity is a regression test: names whose
+// endpoints have all expired must not hold maxNames capacity against a new
+// name in the window before the sweeper runs.
+func TestExpiredNamesFreeNameCapacity(t *testing.T) {
+	s, clk := newTestStore(t, func(c *registryConfig) { c.maxNames = 1 })
+
+	if err := s.Register("old.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 5*time.Second, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	clk.Advance(6 * time.Second) // old name fully expired; no sweep has run
+
+	if err := s.Register("new.cloud.zeno", []string{"tcp://10.0.0.2:2222"}, 5*time.Second, nil); err != nil {
+		t.Fatalf("register after name expiry must succeed, got: %v", err)
+	}
+	if _, _, found := s.Discover("new.cloud.zeno"); !found {
+		t.Fatal("new name not registered")
+	}
+	if _, _, found := s.Discover("old.cloud.zeno"); found {
+		t.Fatal("expired name must be gone after reclamation")
+	}
+}
+
+// TestAdoptFrom verifies the deep copy used when a reload moves the listen
+// address: the new store inherits every registration and the donor is left
+// untouched.
+func TestAdoptFrom(t *testing.T) {
+	old, _ := newTestStore(t)
+	if err := old.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, map[string]string{"v": "1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	fresh, _ := newTestStore(t)
+	if n := fresh.adoptFrom(old); n != 1 {
+		t.Fatalf("expected 1 name adopted, got %d", n)
+	}
+	eps, _, found := fresh.Discover("svc.cloud.zeno")
+	if !found || len(eps) != 1 || eps[0].meta["v"] != "1" {
+		t.Fatalf("adopted registration wrong: %v (found=%v)", eps, found)
+	}
+	// Deep copy: mutating the adopted store must not touch the donor.
+	fresh.Unregister("svc.cloud.zeno", nil)
+	if _, _, found := old.Discover("svc.cloud.zeno"); !found {
+		t.Fatal("donor store must be unaffected by the adopting store")
 	}
 }
 

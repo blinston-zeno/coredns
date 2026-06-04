@@ -32,7 +32,13 @@ type runner struct {
 }
 
 func newRunner(cfg registryConfig) *runner {
-	return &runner{cfg: cfg, store: newRegistryStore(cfg)}
+	return newRunnerWithStore(cfg, newRegistryStore(cfg))
+}
+
+// newRunnerWithStore wraps an existing store; used by revive after a failed
+// reload so the surviving registrations keep their runner.
+func newRunnerWithStore(cfg registryConfig, store *RegistryStore) *runner {
+	return &runner{cfg: cfg, store: store}
 }
 
 // start binds the REP socket and spawns the worker and sweeper goroutines.
@@ -112,6 +118,18 @@ func (r *runner) listening() bool {
 	return r.started && !r.stopped
 }
 
+func (r *runner) isStarted() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.started
+}
+
+func (r *runner) isStopped() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stopped
+}
+
 // serveWorker is one REP request slot: each context serves one request at a
 // time, multiplexed over the shared socket (the same mechanism the resolver
 // mode uses on the REQ side).
@@ -144,10 +162,12 @@ func (r *runner) sweeper() {
 		case <-r.done:
 			return
 		case <-ticker.C:
-			if n := r.store.Sweep(); n > 0 {
-				expirationsCount.Add(float64(n))
+			// Sweep already visits every entry; it returns the surviving
+			// counts so the gauges need no second full scan.
+			reclaimed, names, endpoints := r.store.Sweep()
+			if reclaimed > 0 {
+				expirationsCount.Add(float64(reclaimed))
 			}
-			names, endpoints := r.store.Stats()
 			registryNames.Set(float64(names))
 			registryEndpoints.Set(float64(endpoints))
 		}
@@ -236,11 +256,9 @@ func (r *runner) handleDiscover(b *discoverBody) []byte {
 		if len(merged) > 0 {
 			reply.Meta = merged
 		}
-		ttl := uint32(minRemaining / time.Second)
-		if ttl == 0 {
-			ttl = 1
-		}
-		reply.TTL = ttl
+		// Truncate, never round up: a sub-second remaining lease reports
+		// TTL 0 so a consumer can never cache past the lease.
+		reply.TTL = uint32(minRemaining / time.Second)
 	}
 	return marshalReply(reply)
 }

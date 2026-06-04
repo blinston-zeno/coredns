@@ -182,6 +182,96 @@ func TestServeDNSEmptyReply(t *testing.T) {
 	}
 }
 
+func TestServeDNSNXDOMAIN(t *testing.T) {
+	addr := "inproc://zenet-test-nxdomain"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		b, _ := json.Marshal(backendReply{Query: []string{}, Rcode: rcodeNXDomain})
+		return b, true
+	})
+	z := newTestZenet(t, addr)
+
+	code, err, msg := doQuery(t, z, "missing.example.org.", dns.TypeA)
+	if err != nil || code != dns.RcodeNameError {
+		t.Fatalf("expected NXDOMAIN, got code=%d err=%v", code, err)
+	}
+	if msg.Rcode != dns.RcodeNameError {
+		t.Errorf("expected response rcode NXDOMAIN, got %d", msg.Rcode)
+	}
+	if !msg.Authoritative {
+		t.Error("expected authoritative answer")
+	}
+	if len(msg.Answer) != 0 {
+		t.Errorf("expected empty answer, got %v", msg.Answer)
+	}
+}
+
+// TestServeDNSNXDOMAINIgnoresValues verifies that rcode NXDOMAIN wins even if
+// the backend also (contradictorily) returned values.
+func TestServeDNSNXDOMAINIgnoresValues(t *testing.T) {
+	addr := "inproc://zenet-test-nxdomain-values"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		b, _ := json.Marshal(backendReply{Query: []string{"10.1.2.3"}, Rcode: rcodeNXDomain})
+		return b, true
+	})
+	z := newTestZenet(t, addr)
+
+	code, err, msg := doQuery(t, z, "missing.example.org.", dns.TypeA)
+	if err != nil || code != dns.RcodeNameError {
+		t.Fatalf("expected NXDOMAIN, got code=%d err=%v", code, err)
+	}
+	if len(msg.Answer) != 0 {
+		t.Errorf("expected empty answer, got %v", msg.Answer)
+	}
+}
+
+func TestServeDNSNXDOMAINFallthrough(t *testing.T) {
+	addr := "inproc://zenet-test-nxdomain-fall"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		b, _ := json.Marshal(backendReply{Query: []string{}, Rcode: rcodeNXDomain})
+		return b, true
+	})
+	z := newTestZenet(t, addr)
+	z.Fall = fall.Root
+	z.Next = test.NextHandler(dns.RcodeRefused, nil)
+
+	code, err, _ := doQuery(t, z, "missing.example.org.", dns.TypeA)
+	if err != nil || code != dns.RcodeRefused {
+		t.Fatalf("expected fallthrough to next plugin (REFUSED), got code=%d err=%v", code, err)
+	}
+}
+
+func TestServeDNSBadRcode(t *testing.T) {
+	addr := "inproc://zenet-test-badrcode"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		return []byte(`{"query":[],"rcode":"WAT"}`), true
+	})
+	z := newTestZenet(t, addr)
+
+	code, err, _ := doQuery(t, z, "host.example.org.", dns.TypeA)
+	if err == nil || code != dns.RcodeServerFailure {
+		t.Fatalf("expected SERVFAIL with error, got code=%d err=%v", code, err)
+	}
+}
+
+// TestServeDNSExplicitNoError verifies an explicit "NOERROR" rcode behaves
+// like an absent one.
+func TestServeDNSExplicitNoError(t *testing.T) {
+	addr := "inproc://zenet-test-noerror"
+	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {
+		b, _ := json.Marshal(backendReply{Query: []string{"10.1.2.3"}, Rcode: rcodeNoError})
+		return b, true
+	})
+	z := newTestZenet(t, addr)
+
+	code, err, msg := doQuery(t, z, "host.example.org.", dns.TypeA)
+	if err != nil || code != dns.RcodeSuccess {
+		t.Fatalf("expected success, got code=%d err=%v", code, err)
+	}
+	if len(msg.Answer) != 1 {
+		t.Fatalf("expected 1 answer, got %d", len(msg.Answer))
+	}
+}
+
 func TestServeDNSBadIP(t *testing.T) {
 	addr := "inproc://zenet-test-badip"
 	newTestBackend(t, addr, 1, func(q resolverQuery) ([]byte, bool) {

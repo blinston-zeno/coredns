@@ -54,9 +54,12 @@ type resolverQuery struct {
 	} `json:"query"`
 }
 
-// backendReply is the JSON response received from the backend.
+// backendReply is the JSON response received from the backend. Rcode is
+// optional: absent or "NOERROR" means success; "NXDOMAIN" means the name does
+// not exist (Query is ignored in that case).
 type backendReply struct {
 	Query []string `json:"query"`
+	Rcode string   `json:"rcode,omitempty"`
 }
 
 // typeToString maps a DNS qtype to the backend's type string. The second
@@ -140,7 +143,7 @@ func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	}
 
 	start := time.Now()
-	values, errType, err := z.query(state.Name(), qtype)
+	reply, errType, err := z.query(state.Name(), qtype)
 	requestDuration.WithLabelValues(server).Observe(time.Since(start).Seconds())
 	if err != nil {
 		errorsCount.WithLabelValues(server, errType).Inc()
@@ -151,6 +154,21 @@ func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		return dns.RcodeServerFailure, err
 	}
 
+	if reply.Rcode == rcodeNXDomain {
+		nxdomainCount.WithLabelValues(server).Inc()
+		if z.Fall.Through(state.Name()) {
+			return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
+		}
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeNameError)
+		m.Authoritative = true
+		if err := w.WriteMsg(m); err != nil {
+			return dns.RcodeServerFailure, err
+		}
+		return dns.RcodeNameError, nil
+	}
+
+	values := reply.Query
 	if len(values) == 0 {
 		nodataCount.WithLabelValues(server).Inc()
 		if z.Fall.Through(state.Name()) {
@@ -186,17 +204,24 @@ func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	return dns.RcodeSuccess, nil
 }
 
+// Backend reply rcode values.
+const (
+	rcodeNoError  = "NOERROR"
+	rcodeNXDomain = "NXDOMAIN"
+)
+
 // query sends a single request to the backend over a fresh mangos context and
-// returns the reply values. The second return value is a short error type
-// label for metrics: "context", "send", "timeout", "recv" or "decode".
-func (z *Zenet) query(name, qtype string) ([]string, string, error) {
+// returns the parsed reply. The second return value is a short error type
+// label for metrics: "context", "send", "timeout", "recv", "decode" or
+// "bad_rcode".
+func (z *Zenet) query(name, qtype string) (backendReply, string, error) {
 	q := resolverQuery{}
 	q.Query.Name = name
 	q.Query.QType = qtype
 
 	jsonData, err := json.Marshal(q)
 	if err != nil {
-		return nil, "encode", fmt.Errorf("failed to encode query as JSON: %w", err)
+		return backendReply{}, "encode", fmt.Errorf("failed to encode query as JSON: %w", err)
 	}
 
 	// Each context is an independent request slot multiplexed over the
@@ -204,34 +229,39 @@ func (z *Zenet) query(name, qtype string) ([]string, string, error) {
 	// concurrent request/reply pairs.
 	mctx, err := z.sock.OpenContext()
 	if err != nil {
-		return nil, "context", fmt.Errorf("failed to open mangos context: %w", err)
+		return backendReply{}, "context", fmt.Errorf("failed to open mangos context: %w", err)
 	}
 	defer mctx.Close()
 
 	if err := mctx.SetOption(mangos.OptionSendDeadline, z.timeout); err != nil {
-		return nil, "context", fmt.Errorf("failed to set send deadline: %w", err)
+		return backendReply{}, "context", fmt.Errorf("failed to set send deadline: %w", err)
 	}
 	if err := mctx.SetOption(mangos.OptionRecvDeadline, z.timeout); err != nil {
-		return nil, "context", fmt.Errorf("failed to set recv deadline: %w", err)
+		return backendReply{}, "context", fmt.Errorf("failed to set recv deadline: %w", err)
 	}
 
 	if err := mctx.Send(jsonData); err != nil {
-		return nil, "send", fmt.Errorf("failed to send query to backend: %w", err)
+		return backendReply{}, "send", fmt.Errorf("failed to send query to backend: %w", err)
 	}
 
 	msg, err := mctx.Recv()
 	if err != nil {
 		if errors.Is(err, mangos.ErrRecvTimeout) {
-			return nil, "timeout", fmt.Errorf("timeout waiting for backend reply: %w", err)
+			return backendReply{}, "timeout", fmt.Errorf("timeout waiting for backend reply: %w", err)
 		}
-		return nil, "recv", fmt.Errorf("failed to receive reply from backend: %w", err)
+		return backendReply{}, "recv", fmt.Errorf("failed to receive reply from backend: %w", err)
 	}
 
 	var reply backendReply
 	if err := json.Unmarshal(msg, &reply); err != nil {
-		return nil, "decode", fmt.Errorf("failed to decode backend reply: %w", err)
+		return backendReply{}, "decode", fmt.Errorf("failed to decode backend reply: %w", err)
 	}
-	return reply.Query, "", nil
+	switch reply.Rcode {
+	case "", rcodeNoError, rcodeNXDomain:
+	default:
+		return backendReply{}, "bad_rcode", fmt.Errorf("unknown rcode from backend: %q", reply.Rcode)
+	}
+	return reply, "", nil
 }
 
 // appendIPAnswers parses each value as an IP address and appends the records

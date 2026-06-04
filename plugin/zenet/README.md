@@ -50,12 +50,16 @@ Request, sent as JSON over the REQ socket:
 `type` is one of `A`, `AAAA` or `TXT`. Reply:
 
 ~~~ json
-{"query": ["10.1.2.3"]}
+{"query": ["10.1.2.3"], "rcode": "NOERROR"}
 ~~~
 
-For `A`/`AAAA`, each array element must be an IP address; addresses of the other family are
-skipped. For `TXT`, each element becomes one TXT record. An empty array yields a NOERROR/no-data
-answer (or fallthrough, if configured).
+* `query` - for `A`/`AAAA`, each array element must be an IP address; addresses of the other
+  family are skipped. For `TXT`, each element becomes one TXT record. An empty array yields a
+  NOERROR/no-data answer (the name exists but has no records of this type), or fallthrough if
+  configured.
+* `rcode` - optional. `"NOERROR"` (or absent) means success; `"NXDOMAIN"` means the name does not
+  exist and is answered with an authoritative NXDOMAIN (or fallthrough, if configured), ignoring
+  `query`. Any other value is treated as a backend error (SERVFAIL).
 
 ## Metrics
 
@@ -63,8 +67,9 @@ If monitoring is enabled (via the *prometheus* plugin) then the following metric
 
 * `coredns_zenet_requests_total{server, qtype}` - count of queries answered from the backend.
 * `coredns_zenet_errors_total{server, type}` - count of failed queries, by error type
-  (`unsupported`, `canceled`, `context`, `send`, `timeout`, `recv`, `decode`, `bad_ip`).
+  (`unsupported`, `canceled`, `context`, `send`, `timeout`, `recv`, `decode`, `bad_rcode`, `bad_ip`).
 * `coredns_zenet_dropped_total{server}` - count of queries rejected because `max_concurrent` was exceeded.
+* `coredns_zenet_nxdomain_total{server}` - count of queries the backend answered with NXDOMAIN.
 * `coredns_zenet_nodata_total{server}` - count of queries for which the backend returned no records.
 * `coredns_zenet_request_duration_seconds{server}` - histogram of backend round-trip time.
 
@@ -105,6 +110,6 @@ example.net {
 
 ## Bugs
 
-The wire protocol cannot distinguish "name does not exist" from "name exists but has no records of
-this type", so an empty backend reply is always answered as NOERROR/no-data, never NXDOMAIN.
-Extending the reply with an explicit rcode/status field would require a backend protocol change.
+Negative answers (NXDOMAIN and no-data) carry no SOA record in the authority section, because the
+backend has no zone/SOA concept; downstream resolvers therefore cannot negatively cache them
+(RFC 2308).

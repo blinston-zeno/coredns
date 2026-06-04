@@ -29,6 +29,13 @@ var (
 		Name:      "dropped_total",
 		Help:      "Counter of requests rejected because max_concurrent was exceeded.",
 	}, []string{"server"})
+	// nxdomainCount is the number of requests the backend answered with NXDOMAIN.
+	nxdomainCount = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "nxdomain_total",
+		Help:      "Counter of requests the backend answered with NXDOMAIN.",
+	}, []string{"server"})
 	// nodataCount is the number of requests for which the backend returned no records.
 	nodataCount = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,

@@ -116,3 +116,149 @@ func TestParseOptions(t *testing.T) {
 		t.Errorf("expected ttl 300, got %d", z.ttl)
 	}
 }
+
+func TestParseRegistry(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantErr bool
+	}{
+		{`zenet cloud.zeno {
+			registry
+		}`, false},
+		{`zenet cloud.zeno {
+			registry tcp://10.0.0.5:40900
+			registry_min_ttl 2s
+			registry_max_ttl 60s
+			registry_max_names 100
+			registry_max_endpoints 8
+			registry_max_payload 4096
+			registry_workers 4
+			registry_sweep_interval 500ms
+			ttl 30
+			fallthrough
+		}`, false},
+		// registry and resolver options are mutually exclusive.
+		{`zenet {
+			registry
+			address tcp://backend:1234
+		}`, true},
+		{`zenet {
+			address tcp://backend:1234
+			registry
+		}`, true},
+		{`zenet {
+			registry
+			timeout 5s
+		}`, true},
+		{`zenet {
+			registry
+			max_concurrent 10
+		}`, true},
+		// registry_* options require the registry directive.
+		{`zenet {
+			registry_max_ttl 60s
+		}`, true},
+		// Validation of values.
+		{`zenet {
+			registry no-scheme-here
+		}`, true},
+		{`zenet {
+			registry tcp://a:1 tcp://b:2
+		}`, true},
+		{`zenet {
+			registry
+			registry_min_ttl 60s
+			registry_max_ttl 5s
+		}`, true},
+		{`zenet {
+			registry
+			registry_max_names 0
+		}`, true},
+		{`zenet {
+			registry
+			registry_workers -1
+		}`, true},
+		{`zenet {
+			registry
+			registry_sweep_interval 0s
+		}`, true},
+		{`zenet {
+			registry
+			registry_max_ttl notaduration
+		}`, true},
+	}
+
+	for i, tc := range tests {
+		c := caddy.NewTestController("dns", tc.input)
+		_, err := parse(c)
+		if tc.wantErr && err == nil {
+			t.Errorf("test %d (%q): expected error, got none", i, tc.input)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("test %d (%q): unexpected error: %v", i, tc.input, err)
+		}
+	}
+}
+
+func TestParseRegistryConfig(t *testing.T) {
+	c := caddy.NewTestController("dns", `zenet cloud.zeno {
+		registry tcp://10.0.0.5:40900
+		registry_min_ttl 2s
+		registry_max_ttl 60s
+		registry_max_names 100
+		registry_max_endpoints 8
+		registry_max_payload 4096
+		registry_workers 4
+		registry_sweep_interval 500ms
+		ttl 30
+	}`)
+	z, err := parse(c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if z.mode != modeRegistry {
+		t.Fatal("expected registry mode")
+	}
+	if z.sem != nil {
+		t.Error("semaphore must not be built in registry mode")
+	}
+	cfg := z.regCfg
+	if cfg.listen != "tcp://10.0.0.5:40900" {
+		t.Errorf("listen: got %q", cfg.listen)
+	}
+	if cfg.minTTL != 2*time.Second || cfg.maxTTL != 60*time.Second {
+		t.Errorf("ttl bounds: got %s/%s", cfg.minTTL, cfg.maxTTL)
+	}
+	if cfg.maxNames != 100 || cfg.maxEndpoints != 8 || cfg.maxPayload != 4096 || cfg.workers != 4 {
+		t.Errorf("bounds: got %+v", cfg)
+	}
+	if cfg.sweepInterval != 500*time.Millisecond {
+		t.Errorf("sweep_interval: got %s", cfg.sweepInterval)
+	}
+	if z.ttl != 30 {
+		t.Errorf("dns ttl: got %d", z.ttl)
+	}
+}
+
+func TestParseRegistryDefaults(t *testing.T) {
+	c := caddy.NewTestController("dns", `zenet cloud.zeno {
+		registry
+	}`)
+	z, err := parse(c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if z.mode != modeRegistry {
+		t.Fatal("expected registry mode")
+	}
+	want := defaultRegistryConfig()
+	if z.regCfg.listen != want.listen {
+		t.Errorf("expected default listen %q, got %q", want.listen, z.regCfg.listen)
+	}
+	if z.regCfg.minTTL != want.minTTL || z.regCfg.maxTTL != want.maxTTL {
+		t.Errorf("expected default ttl bounds %s/%s, got %s/%s", want.minTTL, want.maxTTL, z.regCfg.minTTL, z.regCfg.maxTTL)
+	}
+	if z.regCfg.maxNames != want.maxNames || z.regCfg.maxEndpoints != want.maxEndpoints || z.regCfg.maxPayload != want.maxPayload {
+		t.Errorf("expected default bounds, got %+v", z.regCfg)
+	}
+}

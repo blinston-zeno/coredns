@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -29,21 +31,42 @@ var log = clog.NewWithPlugin(pluginName)
 // concurrent backend requests has exceeded max_concurrent.
 var errLimitExceeded = errors.New("concurrent queries exceeded maximum")
 
+// zenetMode selects how queries are answered: by forwarding to an external
+// backend (resolver, the original behavior) or from the in-plugin service
+// registry (registry).
+type zenetMode int
+
+const (
+	modeResolver zenetMode = iota
+	modeRegistry
+)
+
 // Zenet resolves queries against a backend service reachable over a mangos
-// REQ socket. Each in-flight DNS query uses its own mangos context so that
+// REQ socket (resolver mode), or directly from an in-memory service registry
+// fed by a mangos REP registration listener (registry mode). In resolver
+// mode each in-flight DNS query uses its own mangos context so that
 // concurrent requests are multiplexed safely over the single socket.
 type Zenet struct {
 	Next  plugin.Handler
 	Zones []string
 	Fall  fall.F
 
+	mode zenetMode
+
+	// Resolver mode.
 	addr          string
 	timeout       time.Duration
-	ttl           uint32
 	maxConcurrent int64
+	sock          mangos.Socket
+	sem           chan struct{}
 
-	sock mangos.Socket
-	sem  chan struct{}
+	// Registry mode. store and runner are shared, reload-surviving objects
+	// owned by the process-wide runner registry (see shared.go).
+	regCfg registryConfig
+	store  *RegistryStore
+	runner *runner
+
+	ttl uint32 // DNS record TTL; in registry mode the ceiling over the remaining lease
 }
 
 // resolverQuery is the JSON request sent to the backend.
@@ -111,8 +134,15 @@ func (z *Zenet) OnShutdown() error {
 	return err
 }
 
-// Ready implements the ready.Readiness interface.
-func (z *Zenet) Ready() bool { return z.sock != nil }
+// Ready implements the ready.Readiness interface. Resolver mode is ready
+// once the REQ socket exists (it dials asynchronously); registry mode is
+// ready once the registration listener is bound.
+func (z *Zenet) Ready() bool {
+	if z.mode == modeRegistry {
+		return z.runner != nil && z.runner.listening()
+	}
+	return z.sock != nil
+}
 
 // ServeDNS implements the plugin.Handler interface.
 func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -132,6 +162,10 @@ func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	if err := ctx.Err(); err != nil {
 		errorsCount.WithLabelValues(server, "canceled").Inc()
 		return dns.RcodeServerFailure, err
+	}
+
+	if z.mode == modeRegistry {
+		return z.serveFromStore(ctx, w, r, state, server, qtype)
 	}
 
 	select {
@@ -202,6 +236,133 @@ func (z *Zenet) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		return dns.RcodeServerFailure, err
 	}
 	return dns.RcodeSuccess, nil
+}
+
+// serveFromStore answers a query directly from the in-memory registry
+// (registry mode). Negative answers mirror resolver mode: an unregistered
+// name is an authoritative NXDOMAIN, a registered name with no records of
+// the queried family is an authoritative no-data, and both honor
+// fallthrough. There is no backend to fail, so the resolver mode's
+// send/recv/timeout error class does not exist here.
+func (z *Zenet) serveFromStore(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, state request.Request, server, qtype string) (int, error) {
+	discoverCount.WithLabelValues("dns").Inc()
+	eps, minRemaining, found := z.store.Discover(state.Name())
+
+	if !found {
+		nxdomainCount.WithLabelValues(server).Inc()
+		if z.Fall.Through(state.Name()) {
+			return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
+		}
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeNameError)
+		m.Authoritative = true
+		if err := w.WriteMsg(m); err != nil {
+			return dns.RcodeServerFailure, err
+		}
+		return dns.RcodeNameError, nil
+	}
+
+	// The record TTL never outlives the smallest remaining lease, capped by
+	// the configured ttl: a downstream cache must not hand out a replica
+	// past its lease.
+	ttl := uint32(minRemaining / time.Second)
+	if ttl < 1 {
+		ttl = 1
+	}
+	if ttl > z.ttl {
+		ttl = z.ttl
+	}
+
+	m := new(dns.Msg)
+	m.SetReply(r)
+	m.Authoritative = true
+
+	switch state.QType() {
+	case dns.TypeA, dns.TypeAAAA:
+		appendStoreIPAnswers(m, eps, state.QName(), state.QType(), ttl)
+	case dns.TypeTXT:
+		appendStoreTXTAnswers(m, eps, state.QName(), ttl)
+	}
+
+	if len(m.Answer) == 0 {
+		// The name is registered but has no records of the queried family
+		// (e.g. an AAAA query against IPv4-only endpoints).
+		nodataCount.WithLabelValues(server).Inc()
+		if z.Fall.Through(state.Name()) {
+			return plugin.NextOrFailure(z.Name(), z.Next, ctx, w, r)
+		}
+		if err := w.WriteMsg(m); err != nil {
+			return dns.RcodeServerFailure, err
+		}
+		return dns.RcodeSuccess, nil
+	}
+
+	requestsCount.WithLabelValues(server, qtype).Inc()
+	if err := w.WriteMsg(m); err != nil {
+		return dns.RcodeServerFailure, err
+	}
+	return dns.RcodeSuccess, nil
+}
+
+// appendStoreIPAnswers appends one record per distinct endpoint IP matching
+// the queried family. Hosts were validated as IP literals at registration;
+// two replicas sharing an IP (different ports) yield a single record.
+func appendStoreIPAnswers(m *dns.Msg, eps []endpoint, name string, qtype uint16, ttl uint32) {
+	seen := make(map[string]bool, len(eps))
+	for _, ep := range eps {
+		ip := net.ParseIP(ep.host)
+		if ip == nil || seen[ip.String()] {
+			continue
+		}
+		switch {
+		case qtype == dns.TypeA && ip.To4() != nil:
+			m.Answer = append(m.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+				A:   ip.To4(),
+			})
+			seen[ip.String()] = true
+		case qtype == dns.TypeAAAA && ip.To4() == nil:
+			m.Answer = append(m.Answer, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
+				AAAA: ip,
+			})
+			seen[ip.String()] = true
+		}
+	}
+}
+
+// appendStoreTXTAnswers appends one TXT record per endpoint exposing the
+// full endpoint URL, the port and the registered metadata, so DNS-only
+// tooling can see where a service actually listens.
+func appendStoreTXTAnswers(m *dns.Msg, eps []endpoint, name string, ttl uint32) {
+	for _, ep := range eps {
+		parts := []string{"endpoint=" + ep.url, "port=" + ep.port}
+		keys := make([]string, 0, len(ep.meta))
+		for k := range ep.meta {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			parts = append(parts, k+"="+ep.meta[k])
+		}
+		m.Answer = append(m.Answer, &dns.TXT{
+			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: ttl},
+			Txt: chunkTXT(strings.Join(parts, " ")),
+		})
+	}
+}
+
+// chunkTXT splits s into the 255-byte segments a TXT record requires.
+func chunkTXT(s string) []string {
+	if len(s) <= 255 {
+		return []string{s}
+	}
+	var out []string
+	for len(s) > 255 {
+		out = append(out, s[:255])
+		s = s[255:]
+	}
+	return append(out, s)
 }
 
 // Backend reply rcode values.

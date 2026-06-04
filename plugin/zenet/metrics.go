@@ -52,3 +52,53 @@ var (
 		Help:      "Histogram of backend request round-trip time.",
 	}, []string{"server"})
 )
+
+// Registry-mode metrics. The registration listener is not a CoreDNS server
+// block, so these carry no "server" label.
+var (
+	// registrationsCount is the number of accepted registry operations.
+	// Heartbeats are counted as "register".
+	registrationsCount = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "registrations_total",
+		Help:      "Counter of accepted registry operations, by operation.",
+	}, []string{"op"})
+	// registryErrorsCount is the number of rejected registry messages, by
+	// protocol error code.
+	registryErrorsCount = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "registry_errors_total",
+		Help:      "Counter of rejected registry messages, by protocol error code.",
+	}, []string{"error"})
+	// registryNames is the current number of registered service names.
+	registryNames = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "registry_names",
+		Help:      "Gauge of currently registered service names.",
+	})
+	// registryEndpoints is the current number of registered endpoints.
+	registryEndpoints = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "registry_endpoints",
+		Help:      "Gauge of currently registered endpoints across all names.",
+	})
+	// expirationsCount is the number of endpoints reclaimed by the sweeper.
+	expirationsCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "expirations_total",
+		Help:      "Counter of endpoints whose lease expired and were reclaimed.",
+	})
+	// discoverCount is the number of discovery lookups, by source: "rpc" for
+	// protocol discover messages, "dns" for DNS queries served from the store.
+	discoverCount = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: pluginName,
+		Name:      "discover_total",
+		Help:      "Counter of discovery lookups, by source (rpc or dns).",
+	}, []string{"source"})
+)

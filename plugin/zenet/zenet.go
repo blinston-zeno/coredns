@@ -329,8 +329,9 @@ func appendStoreIPAnswers(m *dns.Msg, eps []endpoint, name string, qtype uint16,
 }
 
 // appendStoreTXTAnswers appends one TXT record per endpoint exposing the
-// full endpoint URL, the port and the registered metadata, so DNS-only
-// tooling can see where a service actually listens.
+// full endpoint URL, the port, the registered metadata and any alternate
+// transport URLs (as "alt:<transport>=<url>", after the meta pairs), so
+// DNS-only tooling keeps full information parity with the RPC discover.
 func appendStoreTXTAnswers(m *dns.Msg, eps []endpoint, name string, ttl uint32) {
 	for _, ep := range eps {
 		parts := []string{"endpoint=" + ep.url, "port=" + ep.port}
@@ -341,6 +342,14 @@ func appendStoreTXTAnswers(m *dns.Msg, eps []endpoint, name string, ttl uint32) 
 		sort.Strings(keys)
 		for _, k := range keys {
 			parts = append(parts, k+"="+ep.meta[k])
+		}
+		altKeys := make([]string, 0, len(ep.alts))
+		for k := range ep.alts {
+			altKeys = append(altKeys, k)
+		}
+		sort.Strings(altKeys)
+		for _, k := range altKeys {
+			parts = append(parts, "alt:"+k+"="+ep.alts[k])
 		}
 		m.Answer = append(m.Answer, &dns.TXT{
 			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: ttl},

@@ -218,7 +218,7 @@ func (r *runner) handleRegister(b *registerBody) []byte {
 	if err := validateMeta(b.Meta); err != nil {
 		return errReply(errCodeBadRequest, err.Error())
 	}
-	err := r.store.Register(b.Name, b.Endpoints, time.Duration(b.TTL)*time.Second, b.Meta)
+	err := r.store.Register(b.Name, b.Endpoints, time.Duration(b.TTL)*time.Second, b.Meta, b.Alts)
 	if err != nil {
 		return errReply(storeErrCode(err), err.Error())
 	}
@@ -246,16 +246,27 @@ func (r *runner) handleDiscover(b *discoverBody) []byte {
 	if found {
 		urls := make([]string, len(eps))
 		merged := map[string]string{}
+		var alts map[string]map[string]string
 		for i, ep := range eps { // eps are sorted by URL; later URLs win on key conflicts
 			urls[i] = ep.url
 			for k, v := range ep.meta {
 				merged[k] = v
+			}
+			// Alts stay PER ENDPOINT (keyed by canonical URL, never merged
+			// like meta) — an alternate URL is only meaningful next to the
+			// endpoint it belongs to.
+			if len(ep.alts) > 0 {
+				if alts == nil {
+					alts = make(map[string]map[string]string)
+				}
+				alts[ep.url] = ep.alts // Discover already returned a deep copy
 			}
 		}
 		reply.Endpoints = urls
 		if len(merged) > 0 {
 			reply.Meta = merged
 		}
+		reply.Alts = alts
 		// Truncate, never round up: a sub-second remaining lease reports
 		// TTL 0 so a consumer can never cache past the lease.
 		reply.TTL = uint32(minRemaining / time.Second)

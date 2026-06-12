@@ -264,7 +264,7 @@ func TestReloadAdoption(t *testing.T) {
 	}
 	t.Cleanup(func() { r1.stop() })
 
-	if err := r1.store.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil); err != nil {
+	if err := r1.store.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -327,7 +327,7 @@ func TestReloadAddressChange(t *testing.T) {
 		t.Fatalf("start A: %v", err)
 	}
 	t.Cleanup(func() { rA.stop() })
-	if err := rA.store.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil); err != nil {
+	if err := rA.store.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -377,7 +377,7 @@ func TestReloadAddressChangeRollback(t *testing.T) {
 		t.Fatalf("start A: %v", err)
 	}
 	t.Cleanup(func() { rA.stop() })
-	if err := rA.store.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil); err != nil {
+	if err := rA.store.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -421,7 +421,7 @@ func TestDiscoverRPCTTLSubSecond(t *testing.T) {
 	s, clk := newTestStore(t)
 	r := newRunnerWithStore(defaultRegistryConfig(), s)
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 5*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:40901"}, 5*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	clk.Advance(4*time.Second + 700*time.Millisecond) // 300ms of lease left
@@ -494,5 +494,79 @@ func TestReloadLoopGoroutineStability(t *testing.T) {
 	runtime.GC()
 	if after := runtime.NumGoroutine(); after > baseline+3 {
 		t.Fatalf("goroutine leak across reloads: baseline %d, after %d", baseline, after)
+	}
+}
+
+// ---- alternate-transport (alts) protocol tests ----
+
+func TestListenerAltsRoundTrip(t *testing.T) {
+	addr := "inproc://zenet-reg-alts"
+	newTestRunner(t, addr)
+	rpc := newTestRegClient(t, addr)
+
+	// Two endpoints with DIFFERENT alts: discover must keep them per
+	// endpoint, never merged (unlike meta).
+	reply := rpc(`{"version":1,"register":{"name":"svc.cloud.zeno",
+		"endpoints":["tcp://10.0.0.1:40901","tcp://10.0.0.2:40901"],"ttl":30,
+		"alts":{"tcp://10.0.0.1:40901":{"ipc":"ipc:///run/a.sock"},
+		        "tcp://10.0.0.2:40901":{"tls":"tls+tcp://b.example.com:40943"}}}}`)
+	if !reply.OK {
+		t.Fatalf("register failed: %+v", reply)
+	}
+
+	reply = rpc(`{"discover":{"name":"svc.cloud.zeno"}}`)
+	if !reply.OK || reply.Found == nil || !*reply.Found {
+		t.Fatalf("discover failed: %+v", reply)
+	}
+	a := reply.Alts["tcp://10.0.0.1:40901"]
+	b := reply.Alts["tcp://10.0.0.2:40901"]
+	if a["ipc"] != "ipc:///run/a.sock" || len(a) != 1 {
+		t.Fatalf("endpoint A alts wrong/merged: %v", reply.Alts)
+	}
+	if b["tls"] != "tls+tcp://b.example.com:40943" || len(b) != 1 {
+		t.Fatalf("endpoint B alts wrong/merged: %v", reply.Alts)
+	}
+}
+
+func TestListenerAltsValidationErrorShape(t *testing.T) {
+	addr := "inproc://zenet-reg-alts-invalid"
+	newTestRunner(t, addr)
+	rpc := newTestRegClient(t, addr)
+
+	cases := []string{
+		// unknown transport key
+		`{"register":{"name":"svc.cloud.zeno","endpoints":["tcp://10.0.0.1:1"],"ttl":30,
+			"alts":{"tcp://10.0.0.1:1":{"ws":"ws://10.0.0.1:80"}}}}`,
+		// alts key not among endpoints
+		`{"register":{"name":"svc.cloud.zeno","endpoints":["tcp://10.0.0.1:1"],"ttl":30,
+			"alts":{"tcp://9.9.9.9:9":{"ipc":"ipc:///run/x.sock"}}}}`,
+		// relative ipc path
+		`{"register":{"name":"svc.cloud.zeno","endpoints":["tcp://10.0.0.1:1"],"ttl":30,
+			"alts":{"tcp://10.0.0.1:1":{"ipc":"ipc://run/x.sock"}}}}`,
+	}
+	for i, raw := range cases {
+		reply := rpc(raw)
+		if reply.OK || reply.Error != errCodeEndpointInvalid {
+			t.Errorf("case %d: expected endpoint_invalid, got %+v", i, reply)
+		}
+	}
+	// All-or-nothing held across the wire too.
+	reply := rpc(`{"discover":{"name":"svc.cloud.zeno"}}`)
+	if reply.Found == nil || *reply.Found {
+		t.Fatalf("rejected register reached the store: %+v", reply)
+	}
+}
+
+func TestListenerNoAltsFieldForLegacyRegistrations(t *testing.T) {
+	addr := "inproc://zenet-reg-alts-absent"
+	newTestRunner(t, addr)
+	rpc := newTestRegClient(t, addr)
+
+	if reply := rpc(`{"register":{"name":"svc.cloud.zeno","endpoints":["tcp://10.0.0.1:40901"],"ttl":30}}`); !reply.OK {
+		t.Fatalf("register failed: %+v", reply)
+	}
+	reply := rpc(`{"discover":{"name":"svc.cloud.zeno"}}`)
+	if reply.Alts != nil {
+		t.Fatalf("alts-less registration produced an alts field: %+v", reply.Alts)
 	}
 }

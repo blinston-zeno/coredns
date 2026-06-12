@@ -3,6 +3,7 @@ package zenet
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func newTestStore(t *testing.T, mutate ...func(*registryConfig)) (*RegistryStore
 func TestRegisterAndDiscover(t *testing.T) {
 	s, _ := newTestStore(t)
 
-	err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, map[string]string{"proto": "rep0"})
+	err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, map[string]string{"proto": "rep0"}, nil)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestRegisterAndDiscover(t *testing.T) {
 func TestNameCanonicalization(t *testing.T) {
 	s, _ := newTestStore(t)
 
-	if err := s.Register("SVC.Cloud.Zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("SVC.Cloud.Zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	// Discoverable under any case, with or without trailing dot.
@@ -85,12 +86,12 @@ func TestNameCanonicalization(t *testing.T) {
 func TestRegisterIdempotentRefresh(t *testing.T) {
 	s, clk := newTestStore(t)
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	clk.Advance(20 * time.Second)
 	// Heartbeat: same URL again. Must refresh the lease, not duplicate.
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register (refresh): %v", err)
 	}
 
@@ -107,11 +108,11 @@ func TestPerEndpointExpiry(t *testing.T) {
 	s, clk := newTestStore(t)
 
 	// Endpoint A expires at t+30, endpoint B (registered 20s later) at t+50.
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register A: %v", err)
 	}
 	clk.Advance(20 * time.Second)
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.2:2222"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.2:2222"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register B: %v", err)
 	}
 
@@ -140,7 +141,7 @@ func TestPerEndpointExpiry(t *testing.T) {
 func TestDiscoverAllExpiredIsNotFound(t *testing.T) {
 	s, clk := newTestStore(t)
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 5*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 5*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	clk.Advance(6 * time.Second)
@@ -154,7 +155,7 @@ func TestUnregisterEndpointLeavesSiblings(t *testing.T) {
 	s, _ := newTestStore(t)
 
 	urls := []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}
-	if err := s.Register("svc.cloud.zeno", urls, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", urls, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	s.Unregister("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"})
@@ -168,7 +169,7 @@ func TestUnregisterEndpointLeavesSiblings(t *testing.T) {
 func TestUnregisterWholeName(t *testing.T) {
 	s, _ := newTestStore(t)
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	s.Unregister("svc.cloud.zeno", nil)
@@ -201,7 +202,7 @@ func TestRegisterValidation(t *testing.T) {
 		{"svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "bogus"}, errEndpointInvalid},
 	}
 	for _, c := range cases {
-		err := s.Register(c.name, c.urls, 30*time.Second, nil)
+		err := s.Register(c.name, c.urls, 30*time.Second, nil, nil)
 		if !errors.Is(err, c.want) {
 			t.Errorf("Register(%q, %v): got %v, want %v", c.name, c.urls, err, c.want)
 		}
@@ -212,7 +213,7 @@ func TestRegisterValidation(t *testing.T) {
 	}
 
 	// IPv6 endpoint is valid.
-	if err := s.Register("v6.cloud.zeno", []string{"tcp://[fd00::1]:40901"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("v6.cloud.zeno", []string{"tcp://[fd00::1]:40901"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("IPv6 Register: %v", err)
 	}
 }
@@ -222,16 +223,16 @@ func TestCapacityNames(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		name := fmt.Sprintf("svc%d.cloud.zeno", i)
-		if err := s.Register(name, []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil); err != nil {
+		if err := s.Register(name, []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil); err != nil {
 			t.Fatalf("Register %s: %v", name, err)
 		}
 	}
-	err := s.Register("svc2.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil)
+	err := s.Register("svc2.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil)
 	if !errors.Is(err, errCapacity) {
 		t.Fatalf("expected errCapacity, got %v", err)
 	}
 	// Refreshing an existing name is always allowed at capacity.
-	if err := s.Register("svc0.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc0.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("refresh at capacity: %v", err)
 	}
 }
@@ -239,15 +240,15 @@ func TestCapacityNames(t *testing.T) {
 func TestTooManyEndpoints(t *testing.T) {
 	s, _ := newTestStore(t, func(c *registryConfig) { c.maxEndpoints = 2 })
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.3:3333"}, 30*time.Second, nil)
+	err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.3:3333"}, 30*time.Second, nil, nil)
 	if !errors.Is(err, errTooManyEndpoints) {
 		t.Fatalf("expected errTooManyEndpoints, got %v", err)
 	}
 	// Refreshing the existing endpoints never counts against the cap.
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("refresh at endpoint cap: %v", err)
 	}
 }
@@ -258,13 +259,13 @@ func TestTooManyEndpoints(t *testing.T) {
 func TestExpiredEndpointsFreeTheirSlots(t *testing.T) {
 	s, clk := newTestStore(t, func(c *registryConfig) { c.maxEndpoints = 2 })
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 5*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111", "tcp://10.0.0.2:2222"}, 5*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	clk.Advance(6 * time.Second) // both leases lapsed; no sweep has run
 
 	// A new replica must be accepted: the dead endpoints' slots are free.
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.3:3333"}, 5*time.Second, nil); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.3:3333"}, 5*time.Second, nil, nil); err != nil {
 		t.Fatalf("register after expiry must succeed, got: %v", err)
 	}
 	eps, _, found := s.Discover("svc.cloud.zeno")
@@ -279,12 +280,12 @@ func TestExpiredEndpointsFreeTheirSlots(t *testing.T) {
 func TestExpiredNamesFreeNameCapacity(t *testing.T) {
 	s, clk := newTestStore(t, func(c *registryConfig) { c.maxNames = 1 })
 
-	if err := s.Register("old.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 5*time.Second, nil); err != nil {
+	if err := s.Register("old.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 5*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	clk.Advance(6 * time.Second) // old name fully expired; no sweep has run
 
-	if err := s.Register("new.cloud.zeno", []string{"tcp://10.0.0.2:2222"}, 5*time.Second, nil); err != nil {
+	if err := s.Register("new.cloud.zeno", []string{"tcp://10.0.0.2:2222"}, 5*time.Second, nil, nil); err != nil {
 		t.Fatalf("register after name expiry must succeed, got: %v", err)
 	}
 	if _, _, found := s.Discover("new.cloud.zeno"); !found {
@@ -300,7 +301,7 @@ func TestExpiredNamesFreeNameCapacity(t *testing.T) {
 // untouched.
 func TestAdoptFrom(t *testing.T) {
 	old, _ := newTestStore(t)
-	if err := old.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, map[string]string{"v": "1"}); err != nil {
+	if err := old.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, map[string]string{"v": "1"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -325,14 +326,14 @@ func TestTTLClamp(t *testing.T) {
 		c.maxTTL = 60 * time.Second
 	})
 
-	if err := s.Register("long.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, time.Hour, nil); err != nil {
+	if err := s.Register("long.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, time.Hour, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if _, remaining, _ := s.Discover("long.cloud.zeno"); remaining != 60*time.Second {
 		t.Fatalf("expected lease clamped to 60s, got %s", remaining)
 	}
 
-	if err := s.Register("short.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 0, nil); err != nil {
+	if err := s.Register("short.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 0, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if _, remaining, _ := s.Discover("short.cloud.zeno"); remaining != 5*time.Second {
@@ -343,10 +344,10 @@ func TestTTLClamp(t *testing.T) {
 func TestSetBounds(t *testing.T) {
 	s, _ := newTestStore(t, func(c *registryConfig) { c.maxNames = 1 })
 
-	if err := s.Register("svc0.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc0.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := s.Register("svc1.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil); !errors.Is(err, errCapacity) {
+	if err := s.Register("svc1.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil); !errors.Is(err, errCapacity) {
 		t.Fatalf("expected errCapacity, got %v", err)
 	}
 
@@ -358,7 +359,7 @@ func TestSetBounds(t *testing.T) {
 	if _, _, found := s.Discover("svc0.cloud.zeno"); !found {
 		t.Fatal("existing registration lost after SetBounds")
 	}
-	if err := s.Register("svc1.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil); err != nil {
+	if err := s.Register("svc1.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, nil, nil); err != nil {
 		t.Fatalf("Register after raising bound: %v", err)
 	}
 }
@@ -366,7 +367,7 @@ func TestSetBounds(t *testing.T) {
 func TestDiscoverReturnsCopies(t *testing.T) {
 	s, _ := newTestStore(t)
 
-	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, map[string]string{"k": "v"}); err != nil {
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.0.0.1:1111"}, 30*time.Second, map[string]string{"k": "v"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	eps, _, _ := s.Discover("svc.cloud.zeno")
@@ -392,7 +393,7 @@ func TestConcurrentStoreAccess(t *testing.T) {
 			name := fmt.Sprintf("svc%d.cloud.zeno", w%4)
 			url := fmt.Sprintf("tcp://10.0.0.%d:%d", w+1, 1000+w)
 			for i := 0; i < iters; i++ {
-				if err := s.Register(name, []string{url}, 30*time.Second, nil); err != nil {
+				if err := s.Register(name, []string{url}, 30*time.Second, nil, nil); err != nil {
 					t.Errorf("Register: %v", err)
 					return
 				}
@@ -429,5 +430,155 @@ func TestConcurrentStoreAccess(t *testing.T) {
 	names, endpoints := s.Stats()
 	if endpoints < names {
 		t.Fatalf("inconsistent stats after stress: %d names / %d endpoints", names, endpoints)
+	}
+}
+
+// ---- alternate-transport (alts) tests ----
+
+func TestRegisterWithAltsRoundTrip(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	alts := map[string]map[string]string{
+		"tcp://10.1.2.3:40901": {
+			"ipc": "ipc:///run/svc.sock",
+			"tls": "tls+tcp://svc.example.com:40943",
+		},
+	}
+	if err := s.Register("svc.cloud.zeno", []string{"tcp://10.1.2.3:40901"}, 30*time.Second, nil, alts); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	eps, _, found := s.Discover("svc.cloud.zeno")
+	if !found || len(eps) != 1 {
+		t.Fatalf("discover: found=%v eps=%v", found, eps)
+	}
+	if eps[0].alts["ipc"] != "ipc:///run/svc.sock" || eps[0].alts["tls"] != "tls+tcp://svc.example.com:40943" {
+		t.Fatalf("unexpected alts: %v", eps[0].alts)
+	}
+
+	// Discover must return copies: mutating the result must not leak back.
+	eps[0].alts["ipc"] = "ipc:///run/EVIL.sock"
+	eps2, _, _ := s.Discover("svc.cloud.zeno")
+	if eps2[0].alts["ipc"] != "ipc:///run/svc.sock" {
+		t.Fatal("Discover returned a shared alts map, not a copy")
+	}
+}
+
+func TestRegisterAltsValidation(t *testing.T) {
+	ep := "tcp://10.0.0.1:1111"
+	cases := []struct {
+		name string
+		alts map[string]map[string]string
+	}{
+		{"key not in endpoints", map[string]map[string]string{"tcp://9.9.9.9:9": {"ipc": "ipc:///x"}}},
+		{"unknown transport", map[string]map[string]string{ep: {"ws": "ws://10.0.0.1:80"}}},
+		{"relative ipc path", map[string]map[string]string{ep: {"ipc": "ipc://run/svc.sock"}}},
+		{"non-ipc scheme under ipc", map[string]map[string]string{ep: {"ipc": "tcp://10.0.0.1:1"}}},
+		{"empty alt URL", map[string]map[string]string{ep: {"ipc": ""}}},
+		{"whitespace in URL", map[string]map[string]string{ep: {"ipc": "ipc:///run/has space.sock"}}},
+		{"oversize URL", map[string]map[string]string{ep: {"ipc": "ipc:///" + strings.Repeat("a", maxAltURLBytes)}}},
+		{"tls wrong scheme", map[string]map[string]string{ep: {"tls": "tcp://10.0.0.1:443"}}},
+		{"tls service port", map[string]map[string]string{ep: {"tls": "tls+tcp://10.0.0.1:https"}}},
+		{"tls port zero", map[string]map[string]string{ep: {"tls": "tls+tcp://10.0.0.1:0"}}},
+		{"tls missing port", map[string]map[string]string{ep: {"tls": "tls+tcp://10.0.0.1"}}},
+		{"over alt cap", map[string]map[string]string{ep: {
+			"a": "x", "b": "x", "c": "x", "d": "x", "e": "x"}}},
+	}
+	for _, c := range cases {
+		s, _ := newTestStore(t)
+		err := s.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, c.alts)
+		if !errors.Is(err, errEndpointInvalid) {
+			t.Errorf("%s: expected errEndpointInvalid, got %v", c.name, err)
+		}
+		// All-or-nothing: a rejected register must not create the name.
+		if _, _, found := s.Discover("svc.cloud.zeno"); found {
+			t.Errorf("%s: rejected register mutated the store", c.name)
+		}
+	}
+}
+
+func TestRegisterAltsAcceptedHosts(t *testing.T) {
+	s, _ := newTestStore(t)
+	ep := "tcp://10.0.0.1:1111"
+	alts := map[string]map[string]string{ep: {
+		"tls": "tls+tcp://svc.example.com:443", // DNS name: allowed for tls alts (SNI)
+	}}
+	if err := s.Register("dns.cloud.zeno", []string{ep}, 30*time.Second, nil, alts); err != nil {
+		t.Fatalf("tls alt with DNS host rejected: %v", err)
+	}
+	alts[ep]["tls"] = "tls+tcp://10.0.0.1:443" // IP literal: also allowed
+	if err := s.Register("ip.cloud.zeno", []string{ep}, 30*time.Second, nil, alts); err != nil {
+		t.Fatalf("tls alt with IP host rejected: %v", err)
+	}
+}
+
+func TestRegisterRejectedAltsLeaveExistingStateUntouched(t *testing.T) {
+	s, _ := newTestStore(t)
+	ep := "tcp://10.0.0.1:1111"
+	good := map[string]map[string]string{ep: {"ipc": "ipc:///run/svc.sock"}}
+	if err := s.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, good); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	bad := map[string]map[string]string{ep: {"ws": "ws://10.0.0.1:80"}}
+	if err := s.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, bad); err == nil {
+		t.Fatal("expected rejection")
+	}
+	eps, _, found := s.Discover("svc.cloud.zeno")
+	if !found || eps[0].alts["ipc"] != "ipc:///run/svc.sock" {
+		t.Fatalf("prior registration damaged by rejected register: found=%v eps=%v", found, eps)
+	}
+}
+
+func TestRegisterHeartbeatReplacesAlts(t *testing.T) {
+	s, _ := newTestStore(t)
+	ep := "tcp://10.0.0.1:1111"
+	withAlts := map[string]map[string]string{ep: {"ipc": "ipc:///run/v1.sock"}}
+	if err := s.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, withAlts); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Heartbeat WITHOUT alts clears them (wholesale replacement, like meta).
+	if err := s.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, nil); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	eps, _, _ := s.Discover("svc.cloud.zeno")
+	if len(eps[0].alts) != 0 {
+		t.Fatalf("alts survived an alts-less heartbeat: %v", eps[0].alts)
+	}
+
+	// Heartbeat with NEW alts replaces, not merges.
+	v2 := map[string]map[string]string{ep: {"tls": "tls+tcp://10.0.0.1:443"}}
+	if err := s.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, v2); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	eps, _, _ = s.Discover("svc.cloud.zeno")
+	if _, hasIPC := eps[0].alts["ipc"]; hasIPC || eps[0].alts["tls"] != "tls+tcp://10.0.0.1:443" {
+		t.Fatalf("expected replaced alts, got %v", eps[0].alts)
+	}
+}
+
+func TestAdoptFromCopiesAlts(t *testing.T) {
+	old, _ := newTestStore(t)
+	ep := "tcp://10.0.0.1:1111"
+	alts := map[string]map[string]string{ep: {"ipc": "ipc:///run/svc.sock"}}
+	if err := old.Register("svc.cloud.zeno", []string{ep}, 30*time.Second, nil, alts); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	s, _ := newTestStore(t)
+	if n := s.adoptFrom(old); n != 1 {
+		t.Fatalf("adoptFrom copied %d names, want 1", n)
+	}
+	eps, _, found := s.Discover("svc.cloud.zeno")
+	if !found || eps[0].alts["ipc"] != "ipc:///run/svc.sock" {
+		t.Fatalf("adopted store missing alts: found=%v eps=%v", found, eps)
+	}
+	// Deep copy: mutating the donor must not leak into the adopter.
+	oldEps, _, _ := old.Discover("svc.cloud.zeno")
+	_ = oldEps
+	old.names["svc.cloud.zeno."].eps[ep].alts["ipc"] = "ipc:///run/EVIL.sock"
+	eps, _, _ = s.Discover("svc.cloud.zeno")
+	if eps[0].alts["ipc"] != "ipc:///run/svc.sock" {
+		t.Fatal("adoptFrom shared the alts map with the donor")
 	}
 }

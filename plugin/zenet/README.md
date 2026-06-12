@@ -123,9 +123,9 @@ Request, sent as JSON over the REQ socket:
 JSON messages over a mangos REQ/REP socket, one operation per message. Exactly one of `register`,
 `unregister` or `discover` must be present. `version` is optional and defaults to `1`. `token` is
 parsed but ignored in v1 (reserved for shared-secret authentication). Names are canonicalized
-server-side (lowercase, trailing dot). Endpoint URLs must be `tcp://` with an IP-literal host and a
-numeric port in [1, 65535] (service names like `:http` are rejected — the port string surfaces
-verbatim in TXT answers).
+server-side (lowercase, trailing dot). Canonical endpoint URLs must be `tcp://` with an IP-literal
+host and a numeric port in [1, 65535] (service names like `:http` are rejected — the port string
+surfaces verbatim in TXT answers).
 
 Register (also the heartbeat — an idempotent upsert that refreshes the lease of every listed
 endpoint):
@@ -136,6 +136,29 @@ endpoint):
 
 Reply: `{"ok": true}`. The requested `ttl` (seconds) is clamped to
 [`registry_min_ttl`, `registry_max_ttl`]. `meta` is limited to 16 entries / 1024 bytes.
+
+### Alternate transports (`alts`)
+
+An endpoint may optionally carry alternate-transport URLs so locality-aware clients can pick the
+best path (a same-machine consumer dials the unix socket; a tailnet consumer uses plain `tcp`,
+which WireGuard already encrypts; a consumer outside the tailnet uses `tls`). **Selection is
+entirely client-side** — the registry stores and echoes, it never filters by requester.
+
+~~~ json
+{"version": 1, "register": {"name": "svc.cloud.zeno", "endpoints": ["tcp://10.0.0.12:40901"], "ttl": 30,
+ "alts": {"tcp://10.0.0.12:40901": {"ipc": "ipc:///run/svc.sock", "tls": "tls+tcp://svc.example.com:40943"}}}}
+~~~
+
+Rules: every `alts` key must equal one of the same message's `endpoints`; the transport keys form a
+closed set (`ipc`: an `ipc://` URL with an absolute path; `tls`: a `tls+tcp://` URL whose host may
+be an IP literal **or** a DNS name — alts never feed A/AAAA synthesis, and TLS clients usually need
+a name for SNI); at most 4 alts per endpoint, each URL ≤ 256 bytes; violations are rejected as
+`endpoint_invalid`. Alts share their endpoint's lease and are **replaced wholesale on every
+register** — a heartbeat without `alts` clears them (same semantics as `meta`).
+
+Compatibility: a registry predating this feature ignores the unknown `alts` field (registration
+still succeeds, alts silently dropped). A client that needs to know can probe: register, then
+discover and check whether `alts` is echoed.
 
 Unregister (an empty or absent endpoint list removes the whole name; best-effort — the lease would
 expire anyway):
@@ -173,10 +196,13 @@ Errors (protocol/validation failures only):
 and may change; `error` is stable.
 
 DNS answers in registry mode: `A`/`AAAA` return the distinct endpoint IPs of the matching family
-(replicas sharing an IP are deduplicated); `TXT` returns one record per endpoint of the form
-`endpoint=tcp://10.0.0.12:40901 port=40901 key=value ...`, exposing ports and metadata to DNS-only
-tooling. An unregistered (or fully expired) name is an authoritative NXDOMAIN; a registered name
-with no records of the queried family is an authoritative no-data.
+(replicas sharing an IP are deduplicated; alternate transports never synthesize address records);
+`TXT` returns one record per endpoint of the form
+`endpoint=tcp://10.0.0.12:40901 port=40901 key=value ... alt:ipc=ipc:///run/svc.sock alt:tls=...`
+— meta pairs sorted by key, then `alt:<transport>=<url>` pairs sorted by transport — exposing
+ports, metadata and alternate transports to DNS-only tooling. An unregistered (or fully expired)
+name is an authoritative NXDOMAIN; a registered name with no records of the queried family is an
+authoritative no-data.
 
 ## Metrics
 

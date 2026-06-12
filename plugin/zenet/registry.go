@@ -85,6 +85,7 @@ type endpoint struct {
 	host    string
 	port    string
 	meta    map[string]string
+	alts    map[string]string // transport key ("ipc"/"tls") -> alternate URL; shares the endpoint's lease
 	expires time.Time
 	lease   time.Duration
 }
@@ -136,10 +137,12 @@ func (s *RegistryStore) SetBounds(cfg registryConfig) {
 
 // Register upserts the given endpoint URLs under name, refreshing the lease
 // of any endpoint already present (this is the heartbeat path). The name is
-// canonicalized; every URL is validated before anything is applied, so a
-// rejected register never partially mutates the store. Refreshing existing
-// endpoints never counts against the capacity bounds.
-func (s *RegistryStore) Register(name string, urls []string, ttl time.Duration, meta map[string]string) error {
+// canonicalized; every URL (canonical and alternate) is validated before
+// anything is applied, so a rejected register never partially mutates the
+// store. Refreshing existing endpoints never counts against the capacity
+// bounds. Alts are replaced wholesale per endpoint on every register — a
+// heartbeat without alts clears them, mirroring meta semantics.
+func (s *RegistryStore) Register(name string, urls []string, ttl time.Duration, meta map[string]string, alts map[string]map[string]string) error {
 	cname, err := canonicalizeName(name)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errNameInvalid, err)
@@ -156,6 +159,9 @@ func (s *RegistryStore) Register(name string, urls []string, ttl time.Duration, 
 			return fmt.Errorf("%w: %v", errEndpointInvalid, err)
 		}
 		eps = append(eps, parsed{url: u, host: host, port: port})
+	}
+	if err := validateAlts(urls, alts); err != nil {
+		return fmt.Errorf("%w: %v", errEndpointInvalid, err)
 	}
 
 	if ttl < s.minTTL {
@@ -208,6 +214,7 @@ func (s *RegistryStore) Register(name string, urls []string, ttl time.Duration, 
 			host:    p.host,
 			port:    p.port,
 			meta:    copyMeta(meta),
+			alts:    copyAlts(alts[p.url]),
 			expires: expires,
 			lease:   ttl,
 		}
@@ -272,6 +279,7 @@ func (s *RegistryStore) Discover(name string) (eps []endpoint, minRemaining time
 		}
 		cp := *ep
 		cp.meta = copyMeta(ep.meta)
+		cp.alts = copyAlts(ep.alts)
 		eps = append(eps, cp)
 		if minRemaining == 0 || remaining < minRemaining {
 			minRemaining = remaining
@@ -330,6 +338,7 @@ func (s *RegistryStore) adoptFrom(old *RegistryStore) int {
 		for url, ep := range entry.eps {
 			cp := *ep
 			cp.meta = copyMeta(ep.meta)
+			cp.alts = copyAlts(ep.alts)
 			ne.eps[url] = &cp
 		}
 		s.names[name] = ne
@@ -354,6 +363,18 @@ func copyMeta(meta map[string]string) map[string]string {
 	}
 	cp := make(map[string]string, len(meta))
 	for k, v := range meta {
+		cp[k] = v
+	}
+	return cp
+}
+
+// copyAlts is copyMeta's twin for the per-endpoint alternate-transport map.
+func copyAlts(alts map[string]string) map[string]string {
+	if len(alts) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(alts))
+	for k, v := range alts {
 		cp[k] = v
 	}
 	return cp

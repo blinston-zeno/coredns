@@ -28,7 +28,7 @@ func newTestRegistryZenet(t *testing.T) (*Zenet, *RegistryStore, *fakeClock) {
 
 func mustRegister(t *testing.T, s *RegistryStore, name string, urls []string, ttl time.Duration, meta map[string]string) {
 	t.Helper()
-	if err := s.Register(name, urls, ttl, meta); err != nil {
+	if err := s.Register(name, urls, ttl, meta, nil); err != nil {
 		t.Fatalf("Register(%s): %v", name, err)
 	}
 }
@@ -263,5 +263,38 @@ func TestRegistryModeReady(t *testing.T) {
 	z.runner = newTestRunner(t, addr)
 	if !z.Ready() {
 		t.Fatal("expected ready once the listener is bound")
+	}
+}
+
+func TestStoreServeTXTWithAlts(t *testing.T) {
+	z, s, _ := newTestRegistryZenet(t)
+	alts := map[string]map[string]string{
+		"tcp://10.0.0.1:40901": {
+			"tls": "tls+tcp://svc.example.com:40943",
+			"ipc": "ipc:///run/svc.sock",
+		},
+	}
+	if err := s.Register("svc.cloud.zeno.", []string{"tcp://10.0.0.1:40901"},
+		30*time.Second, map[string]string{"proto": "rep0"}, alts); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	_, _, msg := doQuery(t, z, "svc.cloud.zeno.", dns.TypeTXT)
+	if len(msg.Answer) != 1 {
+		t.Fatalf("expected 1 TXT record, got %d", len(msg.Answer))
+	}
+	txt := msg.Answer[0].(*dns.TXT)
+	joined := strings.Join(txt.Txt, "")
+	// alt:<key>=<url> pairs come AFTER meta, sorted by transport key.
+	want := "endpoint=tcp://10.0.0.1:40901 port=40901 proto=rep0" +
+		" alt:ipc=ipc:///run/svc.sock alt:tls=tls+tcp://svc.example.com:40943"
+	if joined != want {
+		t.Fatalf("TXT mismatch:\n got %q\nwant %q", joined, want)
+	}
+
+	// A answers are unaffected by alts.
+	_, _, msg = doQuery(t, z, "svc.cloud.zeno.", dns.TypeA)
+	if len(msg.Answer) != 1 {
+		t.Fatalf("expected 1 A record, got %d", len(msg.Answer))
 	}
 }
